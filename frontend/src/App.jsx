@@ -6,7 +6,7 @@ import {
   BarChart2, Cpu, ArrowRight, Wifi, WifiOff
 } from 'lucide-react'
 
-const API = '/api'
+const API = 'https://threatwatch-production.up.railway.app'
 
 // ─── Priority config ──────────────────────────────────────────────────────────
 const P = {
