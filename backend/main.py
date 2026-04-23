@@ -1,17 +1,16 @@
 """
 ThreatWatch v2 — AI Security Dashboard Backend
-Fixes:
-  - Unique AI analysis per alert (not same for all)
-  - Action endpoints: escalate / investigate / resolve
-  - Proper SSE with file-watching (no browser refresh needed)
-  - Richer agentic prompt: step-by-step triage + patch guidance
+- Unique AI analysis per alert
+- Action endpoints: escalate / investigate / resolve
+- SSE live stream
+- /ingest endpoint for Ubuntu forwarder
+- In-memory alert storage (ingested alerts persist until restart)
 """
 
 import json
 import os
 import asyncio
 import hashlib
-import time
 from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, Query, HTTPException
@@ -20,10 +19,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from openai import OpenAI
 
-# ─── Config ──────────────────────────────────────────────────────────────────
-ALERTS_FILE  = os.getenv("ALERTS_FILE",  "/var/ossec/logs/alerts/alerts.json")
+# ─── Config ───────────────────────────────────────────────────────────────────
+ALERTS_FILE    = os.getenv("ALERTS_FILE", "/var/ossec/logs/alerts/alerts.json")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-openai_client  = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 app = FastAPI(title="ThreatWatch API", version="2.0")
 app.add_middleware(
@@ -34,24 +34,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory action store  {alert_id: "Escalated"|"Investigating"|"Resolved"}
-alert_actions: dict[str, str] = {}
+# In-memory stores
+alert_actions:    dict[str, str]  = {}
+_ai_cache:        dict[str, dict] = {}
+ingested_alerts:  list[dict]      = []
 
-# AI result cache  {cache_key: {ai_classification, ai_response, ai_steps}}
-_ai_cache: dict[str, dict] = {}
 
-
-# ─── Original Scoring Logic (unchanged) ──────────────────────────────────────
+# ─── Original Scoring Logic (unchanged) ───────────────────────────────────────
 def get_technique_score(desc: str) -> int:
     d = desc.lower()
-    if "credential" in d:       return 9
-    if "privilege" in d:        return 8
-    if "lateral" in d or "smb" in d: return 9
-    if "persistence" in d:      return 8
-    if "defense evasion" in d:  return 9
-    if "powershell" in d:       return 5
-    if "cmd" in d or "execution" in d: return 5
-    if "discovery" in d:        return 4
+    if "credential" in d:                  return 9
+    if "privilege"  in d:                  return 8
+    if "lateral"    in d or "smb" in d:    return 9
+    if "persistence" in d:                 return 8
+    if "defense evasion" in d:             return 9
+    if "powershell" in d:                  return 5
+    if "cmd"        in d or "execution" in d: return 5
+    if "discovery"  in d:                  return 4
     return 3
 
 def get_asset_value(agent: str) -> int:
@@ -87,31 +86,24 @@ def get_priority(score: float) -> str:
 
 def infer_attack_type(desc: str) -> str:
     d = desc.lower()
-    if "credential" in d:              return "Credential Access"
-    if "mimikatz" in d:                return "Credential Dumping"
-    if "powershell" in d:              return "Execution"
-    if "discovery" in d:               return "Discovery"
-    if "lateral" in d or "smb" in d:   return "Lateral Movement"
-    if "privilege" in d:               return "Privilege Escalation"
-    if "persistence" in d:             return "Persistence"
-    if "defense evasion" in d or "amsi" in d: return "Defense Evasion"
-    if "integrity" in d or "checksum" in d:   return "File Integrity"
-    if "netstat" in d or "port" in d:         return "Network Discovery"
-    if "apparmor" in d:                return "Host Protection"
-    if "rootkit" in d:                 return "Rootkit"
+    if "credential"   in d:                        return "Credential Access"
+    if "mimikatz"     in d:                        return "Credential Dumping"
+    if "powershell"   in d:                        return "Execution"
+    if "discovery"    in d:                        return "Discovery"
+    if "lateral"      in d or "smb"     in d:      return "Lateral Movement"
+    if "privilege"    in d:                        return "Privilege Escalation"
+    if "persistence"  in d:                        return "Persistence"
+    if "defense evasion" in d or "amsi" in d:      return "Defense Evasion"
+    if "integrity"    in d or "checksum" in d:     return "File Integrity"
+    if "netstat"      in d or "port"     in d:     return "Network Discovery"
+    if "apparmor"     in d:                        return "Host Protection"
+    if "rootkit"      in d:                        return "Rootkit"
     return "Other"
 
 
-# ─── Agentic AI — Unique Per Alert ───────────────────────────────────────────
+# ─── Agentic AI — Unique Per Alert ────────────────────────────────────────────
 def build_ai_analysis(description: str, severity: int, agent_name: str,
                       attack_type: str, score: float, priority: str) -> dict:
-    """
-    Two-agent pipeline:
-      Agent 1 — Classifier: what is this attack exactly?
-      Agent 2 — SOC Advisor: step-by-step triage + patch guidance
-    Results are cached per unique alert fingerprint.
-    """
-    # Unique cache key — different per description+severity+agent
     cache_key = hashlib.sha256(
         f"{description}|{severity}|{agent_name}".encode()
     ).hexdigest()
@@ -119,24 +111,18 @@ def build_ai_analysis(description: str, severity: int, agent_name: str,
     if cache_key in _ai_cache:
         return _ai_cache[cache_key]
 
-    # ── Fallback (no API key) — still unique per alert ────────────────────
     fallback_classification = (
         f"{attack_type} detected on {agent_name}. "
         f"Wazuh severity level {severity} with formula risk score {score}. "
         f"Priority: {priority}. Alert: \"{description}\"."
     )
-
     fallback_steps = _rule_based_steps(description, attack_type, agent_name, severity)
 
     if not openai_client:
-        result = {
-            "ai_classification": fallback_classification,
-            "ai_response":       fallback_steps,
-        }
+        result = {"ai_classification": fallback_classification, "ai_response": fallback_steps}
         _ai_cache[cache_key] = result
         return result
 
-    # ── Agent 1: Classify ─────────────────────────────────────────────────
     try:
         classification = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -160,7 +146,6 @@ def build_ai_analysis(description: str, severity: int, agent_name: str,
     except Exception:
         classification = fallback_classification
 
-    # ── Agent 2: Step-by-step triage + patch ─────────────────────────────
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -200,7 +185,6 @@ def build_ai_analysis(description: str, severity: int, agent_name: str,
 
 
 def _rule_based_steps(desc: str, attack_type: str, agent: str, severity: int) -> str:
-    """Unique rule-based fallback when no OpenAI key."""
     d = desc.lower()
 
     if "credential" in d or "mimikatz" in d:
@@ -281,8 +265,20 @@ def _rule_based_steps(desc: str, attack_type: str, agent: str, severity: int) ->
             "1. If legitimate — update AppArmor profile carefully.\n"
             "2. If malicious — isolate host and investigate parent process."
         )
+    if "netstat" in d or "port" in d:
+        return (
+            "IMMEDIATE ACTIONS:\n"
+            f"1. Review what new ports opened on {agent}.\n"
+            "2. Check if any unauthorized services started.\n"
+            "3. Compare against known baseline of expected listeners.\n\n"
+            "INVESTIGATION STEPS:\n"
+            "1. Run netstat -tulnp to identify processes on new ports.\n"
+            "2. Check systemd/init logs for recently started services.\n\n"
+            "PATCH / REMEDIATION:\n"
+            "1. Close unauthorized ports via firewall rules.\n"
+            "2. Remove or disable unexpected services."
+        )
 
-    # Generic fallback
     return (
         f"IMMEDIATE ACTIONS:\n"
         f"1. Investigate {agent} — review running processes and network connections.\n"
@@ -310,22 +306,28 @@ MOCK_ALERTS = [
 ]
 
 def load_raw_alerts() -> list[dict]:
-    if not os.path.exists(ALERTS_FILE):
-        return []
-    results = []
-    try:
-        with open(ALERTS_FILE, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    results.append(json.loads(line))
-                except Exception:
-                    continue
-    except Exception:
-        return []
-    return results
+    if ingested_alerts:
+        return list(ingested_alerts)
+
+    if os.path.exists(ALERTS_FILE):
+        results = []
+        try:
+            with open(ALERTS_FILE, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        results.append(json.loads(line))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        if results:
+            return results
+
+    return []
+
 
 def build_alert_object(raw: dict) -> Optional[dict]:
     description = raw.get("rule", {}).get("description", "Unknown alert")
@@ -339,8 +341,7 @@ def build_alert_object(raw: dict) -> Optional[dict]:
     score       = calculate_score(raw)
     priority    = get_priority(score)
     attack_type = infer_attack_type(description)
-
-    ai = build_ai_analysis(description, severity, agent_name, attack_type, score, priority)
+    ai          = build_ai_analysis(description, severity, agent_name, attack_type, score, priority)
 
     alert_id = hashlib.sha256(
         f"{agent_name}|{description}|{timestamp}".encode()
@@ -361,8 +362,9 @@ def build_alert_object(raw: dict) -> Optional[dict]:
         "status":            alert_actions.get(alert_id, "Open"),
     }
 
+
 def get_all_alerts() -> list[dict]:
-    raw_list = load_raw_alerts() or MOCK_ALERTS
+    raw_list  = load_raw_alerts() or MOCK_ALERTS
     processed = []
     for raw in raw_list:
         obj = build_alert_object(raw)
@@ -376,6 +378,7 @@ def get_all_alerts() -> list[dict]:
 @app.get("/")
 def root():
     return {"status": "running", "api": "ThreatWatch", "version": "2.0"}
+
 
 @app.get("/alerts")
 def get_alerts(
@@ -396,6 +399,7 @@ def get_alerts(
                   q in a["attack_type"].lower()]
     return {"alerts": alerts, "total": len(alerts)}
 
+
 @app.get("/alerts/summary")
 def get_summary():
     alerts = get_all_alerts()
@@ -403,7 +407,7 @@ def get_summary():
     atk    = {}
     agt    = {}
     for a in alerts:
-        by_p[a["priority"]] = by_p.get(a["priority"], 0) + 1
+        by_p[a["priority"]]   = by_p.get(a["priority"],   0) + 1
         atk[a["attack_type"]] = atk.get(a["attack_type"], 0) + 1
         agt[a["agent_name"]]  = agt.get(a["agent_name"],  0) + 1
     top_atk = sorted(atk.items(), key=lambda x: x[1], reverse=True)[:5]
@@ -418,6 +422,7 @@ def get_summary():
         "most_affected_agent":   top_agt[0][0] if top_agt else "N/A",
     }
 
+
 @app.get("/alerts/{alert_id}")
 def get_alert(alert_id: str):
     for a in get_all_alerts():
@@ -425,15 +430,16 @@ def get_alert(alert_id: str):
             return a
     raise HTTPException(status_code=404, detail="Alert not found")
 
+
 @app.post("/refresh")
 def refresh():
     _ai_cache.clear()
     return {"status": "refreshed", "alert_count": len(get_all_alerts())}
 
 
-# ── Action endpoints (Escalate / Investigate / Resolve) ──────────────────────
+# ─── Action endpoints ─────────────────────────────────────────────────────────
 class ActionRequest(BaseModel):
-    action: str  # "Escalated" | "Investigating" | "Resolved"
+    action: str
 
 @app.post("/alerts/{alert_id}/action")
 def set_action(alert_id: str, body: ActionRequest):
@@ -448,12 +454,11 @@ def get_action(alert_id: str):
     return {"alert_id": alert_id, "status": alert_actions.get(alert_id, "Open")}
 
 
-# ── SSE Live Stream (file-watching, no browser refresh needed) ────────────────
+# ─── SSE Live Stream ──────────────────────────────────────────────────────────
 @app.get("/alerts/stream/live")
 async def live_stream():
     async def generator():
         seen_ids: set[str] = set()
-        # Seed with existing alerts so we only push truly NEW ones
         for a in get_all_alerts():
             seen_ids.add(a["id"])
 
@@ -465,7 +470,6 @@ async def live_stream():
                     if alert["id"] not in seen_ids:
                         seen_ids.add(alert["id"])
                         yield f"data: {json.dumps(alert)}\n\n"
-                # Also push status changes
                 for alert in current:
                     if alert_actions.get(alert["id"]) != alert.get("status"):
                         alert["status"] = alert_actions.get(alert["id"], "Open")
@@ -478,13 +482,29 @@ async def live_stream():
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
 # ─── /ingest — receives alerts from Ubuntu forwarder ─────────────────────────
 @app.post("/ingest")
 async def ingest_alert(alert: dict):
-    """
-    Called by forwarder.py running on Ubuntu.
-    Receives raw Wazuh alert JSON, scores it, runs AI, saves to Supabase.
-    """
+    desc  = alert.get("rule", {}).get("description", "")
+    agent = alert.get("agent", {}).get("name", "")
+    ts    = alert.get("timestamp", "")
+    key   = hashlib.sha256(f"{agent}|{desc}|{ts}".encode()).hexdigest()[:14]
+
+    for existing in ingested_alerts:
+        e_desc  = existing.get("rule", {}).get("description", "")
+        e_agent = existing.get("agent", {}).get("name", "")
+        e_ts    = existing.get("timestamp", "")
+        e_key   = hashlib.sha256(f"{e_agent}|{e_desc}|{e_ts}".encode()).hexdigest()[:14]
+        if e_key == key:
+            return {"status": "duplicate", "id": key}
+
+    ingested_alerts.append(alert)
+
+    if len(ingested_alerts) > 500:
+        ingested_alerts.pop(0)
+
     obj = build_alert_object(alert)
     if obj:
         return {"status": "saved", "id": obj["id"]}
