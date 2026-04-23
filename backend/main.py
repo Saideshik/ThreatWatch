@@ -478,3 +478,14 @@ async def live_stream():
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+# ─── /ingest — receives alerts from Ubuntu forwarder ─────────────────────────
+@app.post("/ingest")
+async def ingest_alert(alert: dict):
+    """
+    Called by forwarder.py running on Ubuntu.
+    Receives raw Wazuh alert JSON, scores it, runs AI, saves to Supabase.
+    """
+    obj = build_alert_object(alert)
+    if obj:
+        return {"status": "saved", "id": obj["id"]}
+    return {"status": "skipped (CIS or invalid)"}
